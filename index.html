@@ -466,9 +466,15 @@ const GraphDB = (() => {
     } catch (e) { statusFn(false); throw erro('unavailable', 'Sem conexão com o OneDrive.'); }
     statusFn(true);
     if (r.status === 401 && !retried) return call(method, url, opts, true);
+    if (r.status === 403) throw erro('forbidden', 'A Microsoft não liberou o acesso à pasta do app (' + await why(r) + ').');
     if (r.status === 401) throw erro('revoked', 'A Microsoft recusou o acesso.');
     if (r.status === 429 || r.status === 503 || r.status === 504) throw erro('unavailable', 'O OneDrive pediu para esperar um pouco.');
     return r;
+  }
+  async function why(r) {
+    let t = '';
+    try { const j = await r.clone().json(); if (j && j.error) t = (j.error.code || '') + (j.error.message ? ': ' + j.error.message : ''); } catch (e) { /* sem corpo */ }
+    return 'HTTP ' + r.status + (t ? ' — ' + t : '');
   }
   async function download(it) {
     const url = it['@microsoft.graph.downloadUrl'];
@@ -487,7 +493,7 @@ const GraphDB = (() => {
   async function readDoc(path) {
     const r = await call('GET', at('dados/' + path + '.json'));
     if (r.status === 404) { cache.delete(path); return { exists: false }; }
-    if (!r.ok) throw erro('unavailable', 'Erro ' + r.status + ' ao ler ' + path + '.');
+    if (!r.ok) throw erro('unavailable', 'Não consegui ler ' + path + ' (' + await why(r) + ').');
     const it = await r.json();
     const c = cache.get(path);
     if (c && c.etag && c.etag === it.eTag) return { exists: c.data != null, data: c.data };
@@ -501,7 +507,7 @@ const GraphDB = (() => {
     while (url) {
       const r = await call('GET', url);
       if (r.status === 404) break;
-      if (!r.ok) throw erro('unavailable', 'Erro ' + r.status + ' ao listar ' + path + '.');
+      if (!r.ok) throw erro('unavailable', 'Não consegui listar ' + path + ' (' + await why(r) + ').');
       const j = await r.json();
       for (const it of (j.value || [])) {
         if (!it.file || !/\.json$/i.test(it.name)) continue;
@@ -518,32 +524,31 @@ const GraphDB = (() => {
     for (const k of [...cache.keys()]) if (k.startsWith(path + '/') && k.indexOf('/', path.length + 1) < 0 && !seen.has(k)) cache.delete(k);
     return found.filter(d => d.data && typeof d.data === 'object').sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
   }
+  async function mkdirs(path) {
+    const parts = ('dados/' + path).split('/').slice(0, -1);
+    for (let i = 0; i < parts.length; i++) {
+      const parent = parts.slice(0, i).join('/');
+      const r = await call('POST', (parent ? at(parent) : ROOT) + '/children', { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: parts[i], folder: {}, '@microsoft.graph.conflictBehavior': 'fail' }) });
+      if (!r.ok && r.status !== 409) throw erro('unavailable', 'Não consegui criar a pasta ' + parts.slice(0, i + 1).join('/') + ' (' + await why(r) + ').');
+    }
+  }
   async function writeDoc(path, data) {
     const body = JSON.stringify(data, null, 1) + '\n';
-    const r = await call('PUT', at('dados/' + path + '.json') + '/content', { headers: { 'Content-Type': 'application/json' }, body });
+    const put = () => call('PUT', at('dados/' + path + '.json') + '/content', { headers: { 'Content-Type': 'application/json' }, body });
+    let r = await put();
+    if (r.status === 404) { await mkdirs(path); r = await put(); }
     if (!r.ok) {
       if (r.status === 507) throw erro('quota_exceeded', 'O OneDrive está sem espaço.');
       if (r.status === 400 || r.status === 409) throw erro('invalid_argument', 'O OneDrive recusou o arquivo.');
-      throw erro('unavailable', 'Erro ' + r.status + ' ao salvar.');
+      throw erro('unavailable', 'Não consegui salvar (' + await why(r) + ').');
     }
     const it = await r.json().catch(() => null);
     cache.set(path, { etag: it && it.eTag, data: JSON.parse(body) });
   }
   async function deleteDoc(path) {
     const r = await call('DELETE', at('dados/' + path + '.json'));
-    if (!r.ok && r.status !== 404) throw erro('unavailable', 'Erro ' + r.status + ' ao apagar.');
+    if (!r.ok && r.status !== 404) throw erro('unavailable', 'Não consegui apagar (' + await why(r) + ').');
     cache.delete(path);
-  }
-  async function ensureFolders() {
-    try { if (localStorage.getItem('pa.pastas') === '1') return; } catch (e) { /* segue */ }
-    const mk = async (parent, name) => {
-      const url = (parent ? at(parent) : ROOT) + '/children';
-      const r = await call('POST', url, { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' }) });
-      if (!r.ok && r.status !== 409) throw erro('unavailable', 'Erro ' + r.status + ' ao preparar a pasta no OneDrive.');
-    };
-    await mk('', 'dados');
-    for (const f of ['app', 'cycles', 'days']) await mk('dados', f);
-    try { localStorage.setItem('pa.pastas', '1'); } catch (e) { /* segue */ }
   }
   const subs = new Set();
   let timer = null;
@@ -587,9 +592,14 @@ const GraphDB = (() => {
   }
   const collection = path => ({ path, doc: id => doc(path + '/' + id), onSnapshot: (cb, onErr) => listen('col', path, cb, onErr) });
   async function ping() {
-    const r = await call('GET', ROOT);
-    if (!r.ok) throw erro(r.status === 403 ? 'revoked' : 'unavailable', 'Erro ' + r.status + ' ao abrir a pasta do app no OneDrive.');
-    await ensureFolders();
+    let r = await call('GET', ROOT);
+    if (r.status === 404) {
+      /* Numa conta nova a pasta do app só passa a existir na primeira gravação. */
+      const w = await call('PUT', ROOT + ':/LEIA-ME.txt:/content', { headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: 'Pasta de dados do Plano e diário alimentar (https://gabriel-mottagm.github.io/plano-alimentar/).\nOs ciclos, alimentos e registros ficam na subpasta dados/. Não apague esta pasta.\n' });
+      if (!w.ok) throw erro('unavailable', 'Não consegui criar a pasta do app no OneDrive (' + await why(w) + ').');
+      r = await call('GET', ROOT);
+    }
+    if (!r.ok) throw erro('unavailable', 'Não consegui abrir a pasta do app no OneDrive (' + await why(r) + ').');
     return true;
   }
   return { doc, collection, ping, onStatus: fn => { statusFn = fn; } };
@@ -790,7 +800,7 @@ async function flush(path, retried) {
       return flush(path, true);
     }
     if (code === 'invalid_argument') { S.saveError = 'O OneDrive recusou os dados. Recarregue a página e tente de novo.'; }
-    else if (code === 'revoked') { S.authExpired = true; S.saveError = 'Sua sessão com a Microsoft expirou. Clique em “Entrar de novo”.'; }
+    else if (code === 'revoked' || code === 'forbidden') { S.authExpired = true; S.saveError = 'Sua sessão com a Microsoft expirou. Clique em “Entrar de novo”.'; }
     else if (code === 'quota_exceeded') S.saveError = 'O OneDrive está sem espaço.';
     else S.saveError = 'Não consegui salvar no OneDrive. Verifique a internet.';
   }
@@ -815,7 +825,7 @@ function setSync() {
 }
 let unsubs = [], resubTries = 0;
 function onSubErr(e) {
-  if (e && e.code === 'revoked') { S.authExpired = true; S.saveError = 'Sua sessão com a Microsoft expirou. Clique em “Entrar de novo”.'; setSync(); return; }
+  if (e && (e.code === 'revoked' || e.code === 'forbidden')) { S.authExpired = true; S.saveError = 'Sua sessão com a Microsoft expirou. Clique em “Entrar de novo”.'; setSync(); return; }
   S.saveError = 'Conexão com o OneDrive interrompida.';
   setSync();
   if (resubTries < 3) {
@@ -881,7 +891,8 @@ async function initDb() {
   try { await db.ping(); }
   catch (e) {
     if (e.code === 'revoked') { S.authMsg = 'Sua sessão com a Microsoft expirou. Entre de novo.'; showLogin(); return; }
-    S.mode = 'memory'; S.loaded = { foods: true, cycles: true, days: true }; afterData(true); return;
+    if (e.code === 'forbidden') { S.authMsg = e.message + ' Entre de novo e aceite o acesso à pasta do app.'; showLogin(); return; }
+    S.dbError = e.message; S.mode = 'memory'; S.loaded = { foods: true, cycles: true, days: true }; afterData(true); return;
   }
   S.mode = 'db'; setSync();
   subscribe();
@@ -925,7 +936,7 @@ function render() {
   const fid = ae && ae.id && viewEl.contains(ae) ? ae.id : null;
   let ss = null, se = null;
   try { ss = ae.selectionStart; se = ae.selectionEnd; } catch (e) { /* sem seleção */ }
-  const banner = S.mode === 'memory' ? '<div class="banner">Não consegui abrir a pasta do app no seu OneDrive. Verifique a internet e recarregue a página; até lá, nada do que você mudar fica salvo.</div>' : '';
+  const banner = S.mode === 'memory' ? `<div class="banner">Não consegui abrir a pasta do app no seu OneDrive, então nada do que você mudar fica salvo. Recarregue a página; se continuar, me mande este detalhe: ${esc(S.dbError || 'sem detalhe')}</div>` : '';
   let html = '';
   if (S.view === 'plano') html = vPlan();
   else if (S.view === 'diario') html = vDiary();
